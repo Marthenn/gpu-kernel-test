@@ -2,6 +2,7 @@
 .vscode/
 .idea/
 cmake-build-debug/
+.venv/
 
 # Build Folders
 build/
