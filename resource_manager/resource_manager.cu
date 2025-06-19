@@ -4,8 +4,11 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <vector>
-#include <fstream>      // Required for file I/O
-#include <wordexp.h>    // Required for tilde (~) expansion
+#include <fstream>
+#include <wordexp.h>
+#include <dirent.h>     // For reading directory contents
+#include <sys/stat.h>   // For checking file existence
+#include <algorithm>    // For std::remove
 
 // ===================================================================
 // ==                     WORKER DAEMON LOGIC                       ==
@@ -25,8 +28,6 @@ void worker_main_loop(int rank) {
         MPI_Send(props.name, 256, MPI_CHAR, 0, TAG_WORKER_REGISTER, MPI_COMM_WORLD);
     }
 
-    // The worker just waits for a shutdown signal from the master.
-    // It doesn't interact with clients.
     while (true) {
         MPI_Status status;
         MPI_Probe(0, TAG_SHUTDOWN, MPI_COMM_WORLD, &status);
@@ -41,68 +42,21 @@ void worker_main_loop(int rank) {
 std::vector<Node> cluster_nodes;
 int next_allocation_id = 100;
 
-void handle_client_connection(MPI_Comm client_comm) {
-    MPI_Status status;
-    MPI_Probe(0, MPI_ANY_TAG, client_comm, &status);
-
-    // Handle a request for a NEW allocation from this specific client
-    if (status.MPI_TAG == TAG_REQUEST_ALLOCATION) {
-        int num_gpus_requested;
-        MPI_Recv(&num_gpus_requested, 1, MPI_INT, 0, TAG_REQUEST_ALLOCATION, client_comm, MPI_STATUS_IGNORE);
-        printf("[Master] Received request for %d GPUs from a client.\n", num_gpus_requested);
-
-        bool allocated = false;
-        for (auto& node : cluster_nodes) {
-            std::vector<int> free_gpu_ids;
-            for (const auto& gpu : node.gpus) {
-                if (!gpu.is_allocated) free_gpu_ids.push_back(gpu.id);
-            }
-
-            if (free_gpu_ids.size() >= num_gpus_requested) {
-                int allocation_id = next_allocation_id++;
-                std::vector<int> gpus_to_allocate(free_gpu_ids.begin(), free_gpu_ids.begin() + num_gpus_requested);
-
-                for (int gid : gpus_to_allocate) {
-                    node.gpus[gid].is_allocated = true;
-                    node.gpus[gid].allocation_id = allocation_id;
-                }
-
-                MPI_Send(&allocation_id, 1, MPI_INT, 0, TAG_GRANT_ALLOCATION, client_comm);
-                MPI_Send(node.hostname.c_str(), node.hostname.length() + 1, MPI_CHAR, 0, TAG_GRANT_ALLOCATION, client_comm);
-                MPI_Send(gpus_to_allocate.data(), gpus_to_allocate.size(), MPI_INT, 0, TAG_GRANT_ALLOCATION, client_comm);
-                printf("[Master] Granted Allocation %d to client on Node %s.\n", allocation_id, node.hostname.c_str());
-
-                allocated = true;
-                break;
-            }
-        }
-        if (!allocated) {
-            printf("[Master] Could not satisfy request for %d GPUs. Rejecting.\n", num_gpus_requested);
-            int rejection_signal = -1;
-            MPI_Send(&rejection_signal, 1, MPI_INT, 0, TAG_REJECT_ALLOCATION, client_comm);
-        }
+// Helper to expand tilde in path
+std::string expand_path(const char* path) {
+    wordexp_t p;
+    if (wordexp(path, &p, 0) == 0) {
+        std::string res = p.we_wordv[0];
+        wordfree(&p);
+        return res;
     }
-    // Handle a request to RELEASE an allocation
-    else if (status.MPI_TAG == TAG_RELEASE_ALLOCATION) {
-        int allocation_id_to_release;
-        MPI_Recv(&allocation_id_to_release, 1, MPI_INT, 0, TAG_RELEASE_ALLOCATION, client_comm, MPI_STATUS_IGNORE);
-
-        bool found = false;
-        for (auto& node : cluster_nodes) {
-            for (auto& gpu : node.gpus) {
-                if (gpu.is_allocated && gpu.allocation_id == allocation_id_to_release) {
-                    gpu.is_allocated = false;
-                    gpu.allocation_id = -1;
-                    found = true;
-                }
-            }
-        }
-        if (found) {
-            printf("[Master] Released Allocation %d.\n", allocation_id_to_release);
-        }
-    }
+    return "";
 }
 
+// Create directories if they don't exist
+void ensure_dir_exists(const std::string& path) {
+    mkdir(path.c_str(), 0777);
+}
 
 void master_main_loop(int world_size) {
     // 1. Register all workers
@@ -122,46 +76,106 @@ void master_main_loop(int world_size) {
         cluster_nodes.push_back(n);
     }
 
-    // 2. Open a port and write it to a file for the client to find
-    char port_name[MPI_MAX_PORT_NAME];
-    MPI_Open_port(MPI_INFO_NULL, port_name);
+    // 2. Setup communication directories
+    std::string req_dir = expand_path("~/gpu_requests");
+    std::string resp_dir = expand_path("~/gpu_responses");
+    std::string release_dir = expand_path("~/gpu_releases");
+    ensure_dir_exists(req_dir);
+    ensure_dir_exists(resp_dir);
+    ensure_dir_exists(release_dir);
 
-    std::string port_file_path_str;
-    wordexp_t p;
-    // Use wordexp to handle the '~' in the path correctly
-    if (wordexp("~/.gpu_manager.port", &p, 0) == 0) {
-        port_file_path_str = p.we_wordv[0];
-        wordfree(&p);
-    } else {
-        std::cerr << "[Master] Error: Could not expand home directory path for port file." << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    std::ofstream outfile(port_file_path_str);
-    if (!outfile.is_open()) {
-        std::cerr << "[Master] Error: Could not open port file '" << port_file_path_str << "' for writing." << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    outfile << port_name;
-    outfile.close();
-
-    printf("[Master] Resource Manager is active and listening for clients.\n");
-    printf("[Master] Port name written to %s\n", port_file_path_str.c_str());
+    printf("[Master] Resource Manager is active.\n");
+    printf("[Master] Watching for requests in: %s\n", req_dir.c_str());
     printf("------------------------------------------------------------\n");
 
-    // 3. Main loop: accept client connections and handle them
+    // 3. Main polling loop
     while(true) {
-        MPI_Comm client_comm;
-        MPI_Comm_accept(port_name, MPI_INFO_NULL, 0, MPI_COMM_WORLD, &client_comm);
+        // --- Check for new allocation requests ---
+        DIR* dir = opendir(req_dir.c_str());
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != NULL) {
+                std::string filename = entry->d_name;
+                if (filename[0] == '.') continue; // Skip . and ..
 
-        // Handle the connected client
-        handle_client_connection(client_comm);
+                std::string req_filepath = req_dir + "/" + filename;
+                std::ifstream infile(req_filepath);
+                if (infile.is_open()) {
+                    int num_gpus_requested;
+                    infile >> num_gpus_requested;
+                    infile.close();
+                    printf("[Master] Processing request '%s' for %d GPUs.\n", filename.c_str(), num_gpus_requested);
 
-        // Disconnect from the client after handling one request/release cycle
-        MPI_Comm_disconnect(&client_comm);
+                    bool allocated = false;
+                    for (auto& node : cluster_nodes) {
+                        std::vector<int> free_gpu_ids;
+                        for (const auto& gpu : node.gpus) {
+                            if (!gpu.is_allocated) free_gpu_ids.push_back(gpu.id);
+                        }
+
+                        if (free_gpu_ids.size() >= num_gpus_requested) {
+                            int allocation_id = next_allocation_id++;
+                            std::vector<int> gpus_to_allocate(free_gpu_ids.begin(), free_gpu_ids.begin() + num_gpus_requested);
+                            for (int gid : gpus_to_allocate) {
+                                node.gpus[gid].is_allocated = true;
+                                node.gpus[gid].allocation_id = allocation_id;
+                            }
+
+                            // Write response file
+                            std::string resp_filepath = resp_dir + "/" + filename;
+                            std::ofstream outfile(resp_filepath);
+                            outfile << allocation_id << std::endl;
+                            outfile << node.hostname << std::endl;
+                            for (int gid : gpus_to_allocate) outfile << gid << " ";
+                            outfile << std::endl;
+                            outfile.close();
+
+                            printf("[Master] Granted Allocation %d to client on Node %s.\n", allocation_id, node.hostname.c_str());
+                            allocated = true;
+                            break;
+                        }
+                    }
+                    if (!allocated) {
+                        printf("[Master] Could not satisfy request. Rejecting.\n");
+                        std::string resp_filepath = resp_dir + "/" + filename;
+                        std::ofstream outfile(resp_filepath);
+                        outfile << "REJECTED" << std::endl;
+                        outfile.close();
+                    }
+                    std::remove(req_filepath.c_str()); // Delete processed request
+                }
+            }
+            closedir(dir);
+        }
+
+        // --- Check for release requests ---
+        dir = opendir(release_dir.c_str());
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != NULL) {
+                std::string filename = entry->d_name;
+                if (filename[0] == '.') continue;
+
+                int allocation_id_to_release = std::stoi(filename);
+                 bool found = false;
+                for (auto& node : cluster_nodes) {
+                    for (auto& gpu : node.gpus) {
+                        if (gpu.is_allocated && gpu.allocation_id == allocation_id_to_release) {
+                            gpu.is_allocated = false;
+                            gpu.allocation_id = -1;
+                            found = true;
+                        }
+                    }
+                }
+                if (found) {
+                    printf("[Master] Released Allocation %d.\n", allocation_id_to_release);
+                }
+                std::string release_filepath = release_dir + "/" + filename;
+                std::remove(release_filepath.c_str());
+            }
+            closedir(dir);
+        }
+
+        usleep(500000); // Poll every 0.5 seconds
     }
-
-    // Cleanup (in a real daemon, you'd have a signal handler to do this)
-    std::remove(port_file_path_str.c_str());
-    MPI_Close_port(port_name);
 }
