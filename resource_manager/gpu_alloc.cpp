@@ -1,4 +1,3 @@
-#include "resource_manager.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -7,9 +6,21 @@
 #include <stdexcept>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <mpi.h>
 #include <fstream>
-#include <wordexp.h> // Needed for tilde (~) expansion
+#include <wordexp.h>
+#include <thread>
+#include <chrono>
+
+// Helper to expand tilde in path
+std::string expand_path(const char* path) {
+    wordexp_t p;
+    if (wordexp(path, &p, 0) == 0) {
+        std::string res = p.we_wordv[0];
+        wordfree(&p);
+        return res;
+    }
+    return "";
+}
 
 // Helper to build the final ssh command
 std::string build_ssh_command(
@@ -35,7 +46,7 @@ std::string build_ssh_command(
 int main(int argc, char* argv[]) {
     if (argc < 4 || std::string(argv[1]) != "--gpus") {
         std::cerr << "Usage: " << argv[0] << " --gpus <N> -- <your_command_and_args>" << std::endl;
-        std::cerr << "Example: " << argv[0] << " --gpus 2 -- torchrun my_script.py --epochs 10" << std::endl;
+        std::cerr << "Example: " << argv[0] << " --gpus 2 -- ./dummy_job" << std::endl;
         return 1;
     }
 
@@ -52,82 +63,74 @@ int main(int argc, char* argv[]) {
         user_command.push_back(argv[i]);
     }
 
-    MPI_Init(&argc, &argv);
+    // --- File-based communication ---
+    std::string req_dir = expand_path("~/gpu_requests");
+    std::string resp_dir = expand_path("~/gpu_responses");
+    std::string release_dir = expand_path("~/gpu_releases");
 
-    char port_name[MPI_MAX_PORT_NAME];
-    MPI_Comm server_comm;
+    // 1. Create a unique request file
+    std::string request_id = std::to_string(getpid());
+    std::string req_filepath = req_dir + "/" + request_id;
+    std::string resp_filepath = resp_dir + "/" + request_id;
 
-    // Step 1: Read the server's port name from a well-known file
-    std::cout << "[Client] Reading master daemon port from file..." << std::endl;
-    std::string port_file_path_str;
-    wordexp_t p;
-    // Use wordexp to handle the '~' in the path correctly
-    if (wordexp("~/.gpu_manager.port", &p, 0) == 0) {
-        port_file_path_str = p.we_wordv[0];
-        wordfree(&p);
-    } else {
-        std::cerr << "[Client] Error: Could not expand home directory path '~/.gpu_manager.port'." << std::endl;
-        MPI_Finalize();
+    std::ofstream req_file(req_filepath);
+    if (!req_file.is_open()) {
+        std::cerr << "[Client] Error: Could not create request file in " << req_dir << std::endl;
         return 1;
     }
+    req_file << num_gpus << std::endl;
+    req_file.close();
+    std::cout << "[Client] Submitted request " << request_id << " for " << num_gpus << " GPUs. Waiting for response..." << std::endl;
 
-    std::ifstream infile(port_file_path_str);
-    if (!infile.is_open()) {
-        std::cerr << "[Client] Error: Could not open port file '" << port_file_path_str << "'." << std::endl;
-        std::cerr << "Is the resource_manager_daemon running and has it created the port file?" << std::endl;
-        MPI_Finalize();
-        return 1;
-    }
-    infile >> port_name;
-    infile.close();
+    // 2. Poll for the response file
+    int allocation_id = -1;
+    std::string hostname;
+    std::vector<int> gpu_ids;
 
-    // Step 2: Connect to the server using the port name from the file
-    std::cout << "[Client] Connecting to master daemon..." << std::endl;
-    if (MPI_Comm_connect(port_name, MPI_INFO_NULL, 0, MPI_COMM_SELF, &server_comm) != MPI_SUCCESS) {
-        std::cerr << "[Client] Error: Could not connect to the master daemon." << std::endl;
-        MPI_Finalize();
-        return 1;
-    }
+    while (true) {
+        std::ifstream resp_file(resp_filepath);
+        if (resp_file.is_open()) {
+            std::string first_line;
+            resp_file >> first_line;
+            if (first_line == "REJECTED") {
+                std::cerr << "[Client] Allocation request rejected. Not enough free resources." << std::endl;
+                resp_file.close();
+                std::remove(resp_filepath.c_str());
+                return 1;
+            }
 
-    // Step 3: Request Allocation using the new communicator
-    std::cout << "[Client] Requesting " << num_gpus << " GPUs from master..." << std::endl;
-    MPI_Send(&num_gpus, 1, MPI_INT, 0, TAG_REQUEST_ALLOCATION, server_comm);
-
-    // Step 4: Wait for master's response on the new communicator
-    MPI_Status status;
-    MPI_Probe(0, MPI_ANY_TAG, server_comm, &status);
-
-    if (status.MPI_TAG == TAG_REJECT_ALLOCATION) {
-        int sig;
-        MPI_Recv(&sig, 1, MPI_INT, 0, TAG_REJECT_ALLOCATION, server_comm, MPI_STATUS_IGNORE);
-        std::cerr << "[Client] Allocation request rejected. Not enough free resources." << std::endl;
-    } else {
-        int allocation_id;
-        char hostname[256];
-        std::vector<int> gpu_ids(num_gpus);
-
-        MPI_Recv(&allocation_id, 1, MPI_INT, 0, TAG_GRANT_ALLOCATION, server_comm, MPI_STATUS_IGNORE);
-        MPI_Recv(hostname, 256, MPI_CHAR, 0, TAG_GRANT_ALLOCATION, server_comm, MPI_STATUS_IGNORE);
-        MPI_Recv(gpu_ids.data(), num_gpus, MPI_INT, 0, TAG_GRANT_ALLOCATION, server_comm, MPI_STATUS_IGNORE);
-
-        std::cout << "[Client] Allocation " << allocation_id << " granted on node " << hostname << std::endl;
-
-        std::string command_to_run = build_ssh_command(hostname, gpu_ids, user_command);
-        std::cout << "[Client] Executing: " << command_to_run << std::endl;
-        std::cout << "-------------------- JOB OUTPUT START --------------------" << std::endl;
-        int return_code = system(command_to_run.c_str());
-        std::cout << "-------------------- JOB OUTPUT END --------------------" << std::endl;
-
-        if (return_code != 0) {
-            std::cerr << "[Client] User command finished with non-zero exit code: " << return_code << std::endl;
+            // --- Allocation granted ---
+            allocation_id = std::stoi(first_line);
+            resp_file >> hostname;
+            int gpu_id;
+            while(resp_file >> gpu_id) {
+                gpu_ids.push_back(gpu_id);
+            }
+            resp_file.close();
+            std::remove(resp_filepath.c_str());
+            break;
         }
-
-        std::cout << "[Client] Releasing allocation " << allocation_id << "..." << std::endl;
-        MPI_Send(&allocation_id, 1, MPI_INT, 0, TAG_RELEASE_ALLOCATION, server_comm);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    // Step 5: Disconnect and finalize
-    MPI_Comm_disconnect(&server_comm);
-    MPI_Finalize();
+    std::cout << "[Client] Allocation " << allocation_id << " granted on node " << hostname << std::endl;
+
+    // 3. Execute the user's command via SSH
+    std::string command_to_run = build_ssh_command(hostname, gpu_ids, user_command);
+    std::cout << "[Client] Executing: " << command_to_run << std::endl;
+    std::cout << "-------------------- JOB OUTPUT START --------------------" << std::endl;
+    int return_code = system(command_to_run.c_str());
+    std::cout << "-------------------- JOB OUTPUT END --------------------" << std::endl;
+
+    if (return_code != 0) {
+        std::cerr << "[Client] User command finished with non-zero exit code: " << return_code << std::endl;
+    }
+
+    // 4. Create a release file to notify the daemon
+    std::cout << "[Client] Releasing allocation " << allocation_id << "..." << std::endl;
+    std::string release_filepath = release_dir + "/" + std::to_string(allocation_id);
+    std::ofstream release_file(release_filepath);
+    release_file.close();
+
     return 0;
 }
