@@ -4,6 +4,8 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <vector>
+#include <fstream>      // Required for file I/O
+#include <wordexp.h>    // Required for tilde (~) expansion
 
 // ===================================================================
 // ==                     WORKER DAEMON LOGIC                       ==
@@ -120,11 +122,31 @@ void master_main_loop(int world_size) {
         cluster_nodes.push_back(n);
     }
 
-    // 2. Open a port and publish the service name
+    // 2. Open a port and write it to a file for the client to find
     char port_name[MPI_MAX_PORT_NAME];
     MPI_Open_port(MPI_INFO_NULL, port_name);
-    MPI_Publish_name("gpu-manager-service", MPI_INFO_NULL, port_name);
+
+    std::string port_file_path_str;
+    wordexp_t p;
+    // Use wordexp to handle the '~' in the path correctly
+    if (wordexp("~/.gpu_manager.port", &p, 0) == 0) {
+        port_file_path_str = p.we_wordv[0];
+        wordfree(&p);
+    } else {
+        std::cerr << "[Master] Error: Could not expand home directory path for port file." << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    std::ofstream outfile(port_file_path_str);
+    if (!outfile.is_open()) {
+        std::cerr << "[Master] Error: Could not open port file '" << port_file_path_str << "' for writing." << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    outfile << port_name;
+    outfile.close();
+
     printf("[Master] Resource Manager is active and listening for clients.\n");
+    printf("[Master] Port name written to %s\n", port_file_path_str.c_str());
     printf("------------------------------------------------------------\n");
 
     // 3. Main loop: accept client connections and handle them
@@ -140,6 +162,6 @@ void master_main_loop(int world_size) {
     }
 
     // Cleanup (in a real daemon, you'd have a signal handler to do this)
-    MPI_Unpublish_name("gpu-manager-service", MPI_INFO_NULL, port_name);
+    std::remove(port_file_path_str.c_str());
     MPI_Close_port(port_name);
 }

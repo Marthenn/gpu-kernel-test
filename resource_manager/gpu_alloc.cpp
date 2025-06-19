@@ -8,6 +8,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <mpi.h>
+#include <fstream>
+#include <wordexp.h> // Needed for tilde (~) expansion
 
 // Helper to build the final ssh command
 std::string build_ssh_command(
@@ -55,16 +57,31 @@ int main(int argc, char* argv[]) {
     char port_name[MPI_MAX_PORT_NAME];
     MPI_Comm server_comm;
 
-    // Step 1: Look up the service name to find the master's port
-    std::cout << "[Client] Looking up service 'gpu-manager-service'..." << std::endl;
-    if (MPI_Lookup_name("gpu-manager-service", MPI_INFO_NULL, port_name) != MPI_SUCCESS) {
-        std::cerr << "[Client] Error: Could not find service 'gpu-manager-service'." << std::endl;
-        std::cerr << "Is the resource_manager_daemon running?" << std::endl;
+    // Step 1: Read the server's port name from a well-known file
+    std::cout << "[Client] Reading master daemon port from file..." << std::endl;
+    std::string port_file_path_str;
+    wordexp_t p;
+    // Use wordexp to handle the '~' in the path correctly
+    if (wordexp("~/.gpu_manager.port", &p, 0) == 0) {
+        port_file_path_str = p.we_wordv[0];
+        wordfree(&p);
+    } else {
+        std::cerr << "[Client] Error: Could not expand home directory path '~/.gpu_manager.port'." << std::endl;
         MPI_Finalize();
         return 1;
     }
 
-    // Step 2: Connect to the server
+    std::ifstream infile(port_file_path_str);
+    if (!infile.is_open()) {
+        std::cerr << "[Client] Error: Could not open port file '" << port_file_path_str << "'." << std::endl;
+        std::cerr << "Is the resource_manager_daemon running and has it created the port file?" << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
+    infile >> port_name;
+    infile.close();
+
+    // Step 2: Connect to the server using the port name from the file
     std::cout << "[Client] Connecting to master daemon..." << std::endl;
     if (MPI_Comm_connect(port_name, MPI_INFO_NULL, 0, MPI_COMM_SELF, &server_comm) != MPI_SUCCESS) {
         std::cerr << "[Client] Error: Could not connect to the master daemon." << std::endl;
